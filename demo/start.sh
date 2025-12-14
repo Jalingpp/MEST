@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."  # enter MEST root
+# Enter MEST root (script resides in MEST/demo)
+cd "$(dirname "$0")/.."
 
-echo "Building demo server..."
-go build -o demo-server ./demo
+echo "Building demo server into demo/demo-server ..."
+# build the demo server binary inside demo/ to keep repo root clean
+go build -o ./demo/demo-server ./demo
 
 echo "Starting demo server on :8080"
-./demo-server
-
+./demo/demo-server
