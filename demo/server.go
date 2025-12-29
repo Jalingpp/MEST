@@ -32,12 +32,15 @@ package main
 import (
     "bytes"
     "context"
+    "crypto/tls"
     "encoding/json"
     "fmt"
     "io"
     "log"
     "mime/multipart"
+    "net"
     "net/http"
+    "net/url"
     "os"
     "path/filepath"
     "os/signal"
@@ -75,6 +78,8 @@ func main() {
     mux.HandleFunc("/api/get", s.handleGetByPK)
     mux.HandleFunc("/api/search", s.handleSearch)
     mux.HandleFunc("/api/verify", s.handleVerify)
+    // lightweight image proxy to avoid referrer/cert restrictions in browsers
+    mux.HandleFunc("/img", s.handleImageProxy)
 
     addr := ":8080"
     log.Printf("MEST demo backend listening on %s", addr)
@@ -199,6 +204,8 @@ func (s *Server) handleUploadJSON(w http.ResponseWriter, r *http.Request) {
         for _, obj := range items {
             pk, err := derivePrimaryKey(obj)
             if err != nil { res.Errors = append(res.Errors, err.Error()); continue }
+            // Optionally rewrite image URL to an accessible provider
+            rewriteImageInObject(obj, pk)
             j, _ := json.Marshal(obj)
             s.insertPrimary(pk, string(j))
             res.PrimaryInserted++
@@ -209,6 +216,8 @@ func (s *Server) handleUploadJSON(w http.ResponseWriter, r *http.Request) {
         }
         // mapping form
         for pk, obj := range kvMap {
+            // Optionally rewrite image URL to an accessible provider
+            rewriteImageInObject(obj, pk)
             j, _ := json.Marshal(obj)
             s.insertPrimary(pk, string(j))
             res.PrimaryInserted++
@@ -258,6 +267,183 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
     }
     pks := strings.Split(v, ",")
     writeJSON(w, http.StatusOK, map[string]any{"keys": pks})
+}
+
+// handleImageProxy fetches an external image and streams it to the client.
+// This helps when third-party CDNs block the referrer or the browser blocks the request.
+// It only allows a small whitelist of hosts for safety.
+func (s *Server) handleImageProxy(w http.ResponseWriter, r *http.Request) {
+    raw := strings.TrimSpace(r.URL.Query().Get("u"))
+    if raw == "" {
+        http.Error(w, "missing u", http.StatusBadRequest)
+        return
+    }
+    if strings.Contains(raw, "&amp;") { raw = strings.ReplaceAll(raw, "&amp;", "&") }
+    u, err := url.Parse(raw)
+    if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+        http.Error(w, "bad url", http.StatusBadRequest)
+        return
+    }
+    host := strings.ToLower(u.Host)
+    if !isAllowedImageHost(host) {
+        http.Error(w, "forbidden host", http.StatusForbidden)
+        return
+    }
+    tr := &http.Transport{
+        Proxy: http.ProxyFromEnvironment,
+        DialContext: (&net.Dialer{ Timeout: 10 * time.Second, KeepAlive: 15 * time.Second }).DialContext,
+        ForceAttemptHTTP2: true,
+        TLSHandshakeTimeout: 10 * time.Second,
+        ExpectContinueTimeout: 1 * time.Second,
+        DisableKeepAlives: true,
+        TLSClientConfig: &tls.Config{ ServerName: host, NextProtos: []string{"h2", "http/1.1"} },
+    }
+    client := &http.Client{ Timeout: 20 * time.Second, Transport: tr }
+    req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u.String(), nil)
+    if err != nil { http.Error(w, "req error", http.StatusInternalServerError); return }
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+    req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+    req.Header.Set("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7")
+    req.Header.Set("Connection", "close")
+    req.Header.Del("Referer")
+    req.Header.Del("Origin")
+    // (keep generic UA; do not force Referer to avoid mis-fetch)
+
+    resp, err := client.Do(req)
+    if err != nil || resp.StatusCode < 200 || resp.StatusCode > 299 {
+        if resp != nil { _ = resp.Body.Close() }
+        // Optional fallback via images.weserv.nl (enable by env MEST_DEMO_IMG_FALLBACK_WESERV=1)
+        if envBool("MEST_DEMO_IMG_FALLBACK_WESERV") && (isOpenSeaHost(host) || strings.HasSuffix(host, "ipfs.io")) {
+            alt := buildWeservURL(u.String())
+            log.Printf("/img upstream failed for %s, trying weserv: %s", u.String(), alt)
+            req2, err2 := http.NewRequestWithContext(r.Context(), http.MethodGet, alt, nil)
+            if err2 == nil {
+                req2.Header.Set("User-Agent", req.Header.Get("User-Agent"))
+                req2.Header.Set("Accept", req.Header.Get("Accept"))
+                req2.Header.Set("Accept-Language", req.Header.Get("Accept-Language"))
+                req2.Header.Set("Connection", "close")
+                resp2, err3 := client.Do(req2)
+                if err3 == nil && resp2.StatusCode >= 200 && resp2.StatusCode <= 299 {
+                    defer resp2.Body.Close()
+                    if ct := resp2.Header.Get("Content-Type"); ct != "" { w.Header().Set("Content-Type", ct) } else { w.Header().Set("Content-Type", "image/jpeg") }
+                    w.Header().Set("Cache-Control", "public, max-age=600")
+                    w.WriteHeader(http.StatusOK)
+                    _, _ = io.Copy(w, resp2.Body)
+                    return
+                } else if err3 != nil {
+                    log.Printf("weserv fetch error: %v", err3)
+                } else {
+                    log.Printf("weserv upstream status: %s", resp2.Status)
+                    _ = resp2.Body.Close()
+                }
+            }
+        }
+        if err != nil {
+            log.Printf("upstream error for %s: %v", u.String(), err)
+            http.Error(w, "upstream error", http.StatusBadGateway)
+        } else {
+            log.Printf("upstream status for %s: %s", u.String(), resp.Status)
+            http.Error(w, "upstream status "+resp.Status, http.StatusBadGateway)
+        }
+        return
+    }
+    defer resp.Body.Close()
+    if ct := resp.Header.Get("Content-Type"); ct != "" {
+        w.Header().Set("Content-Type", ct)
+    } else {
+        w.Header().Set("Content-Type", "image/jpeg")
+    }
+    w.Header().Set("Cache-Control", "public, max-age=600")
+    w.WriteHeader(http.StatusOK)
+    _, _ = io.Copy(w, resp.Body)
+}
+
+func isAllowedImageHost(h string) bool {
+    // minimal allowlist; extend as needed
+    switch {
+    case strings.HasSuffix(h, "i.seadn.io"),
+         strings.HasSuffix(h, "openseauserdata.com"),
+         strings.HasSuffix(h, "ipfs.io"),
+         strings.HasSuffix(h, "cloudflare-ipfs.com"),
+         strings.HasSuffix(h, "cf-ipfs.com"),
+         strings.HasSuffix(h, "gateway.pinata.cloud"),
+         strings.HasSuffix(h, "nftstorage.link"),
+         strings.HasSuffix(h, "arweave.net"),
+         strings.HasSuffix(h, "images.weserv.nl"):
+        return true
+    default:
+        return false
+    }
+}
+
+func isOpenSeaHost(h string) bool {
+    return strings.HasSuffix(h, "i.seadn.io") || strings.HasSuffix(h, "openseauserdata.com")
+}
+
+func buildWeservURL(orig string) string {
+    return "https://images.weserv.nl/?url=" + url.QueryEscape(orig)
+}
+
+func envBool(key string) bool {
+    v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+    return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// rewriteImageInObject optionally replaces remote image URLs with a stable placeholder
+// when MEST_DEMO_REWRITE_IMAGE=1 is set. This avoids external fetch failures in restricted networks.
+func rewriteImageInObject(obj map[string]any, pk string) {
+    if !envBool("MEST_DEMO_REWRITE_IMAGE") { return }
+    // Prefer data URI when enabled: no外网依赖，最稳
+    if envBool("MEST_DEMO_IMAGE_DATAURI") {
+        repl := buildSVGDataURI(pk)
+        // prefer to write under traits.image if traits is an object; else set top-level image
+        if tv, ok := obj["traits"]; ok {
+            if tm, ok2 := tv.(map[string]any); ok2 {
+                tm["image"] = repl
+                obj["traits"] = tm
+                return
+            }
+        }
+        obj["image"] = repl
+        return
+    }
+    repl := os.Getenv("MEST_DEMO_IMAGE_URL")
+    if strings.TrimSpace(repl) == "" {
+        // default: placehold.co with overlay text showing "<contract>/<tokenId>"
+        // example: https://placehold.co/600x600?text=0xabc...%2F1234
+        repl = "https://placehold.co/600x600?text=" + url.QueryEscape(pk)
+    }
+    // prefer to write under traits.image if traits is an object; else set top-level image
+    if tv, ok := obj["traits"]; ok {
+        if tm, ok2 := tv.(map[string]any); ok2 {
+            tm["image"] = repl
+            obj["traits"] = tm
+            return
+        }
+    }
+    obj["image"] = repl
+}
+
+// buildSVGDataURI builds a visible SVG placeholder with the pk text embedded.
+func buildSVGDataURI(pk string) string {
+    // Simple dark tile with light text; fixed 600x600 for consistency.
+    svg := `<?xml version="1.0" encoding="UTF-8"?>\n` +
+        `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">` +
+        `<rect width="600" height="600" fill="#0f172a"/>` +
+        `<rect x="20" y="20" width="560" height="560" rx="16" ry="16" fill="#111827" stroke="#1f2937"/>` +
+        `<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#cbd5e1" font-family="monospace" font-size="18">` +
+        escapeForSVG(pk) + `</text>` +
+        `</svg>`
+    data := url.QueryEscape(svg)
+    return "data:image/svg+xml;charset=UTF-8," + data
+}
+
+func escapeForSVG(s string) string {
+    // minimal escaping for XML special chars
+    s = strings.ReplaceAll(s, "&", "&amp;")
+    s = strings.ReplaceAll(s, "<", "&lt;")
+    s = strings.ReplaceAll(s, ">", "&gt;")
+    return s
 }
 
 // insertPrimary inserts into primary MPT (pk -> value)
